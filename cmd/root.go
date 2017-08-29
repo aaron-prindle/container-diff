@@ -3,19 +3,23 @@ package cmd
 import (
 	"bytes"
 	"errors"
-	goflag "flag"
 	"fmt"
 	"os"
 	"reflect"
 	"sort"
-	"sync"
 
-	"github.com/GoogleCloudPlatform/container-diff/differs"
 	"github.com/GoogleCloudPlatform/container-diff/utils"
 	"github.com/golang/glog"
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 )
+
+var analyzeFlagMap = map[string]*bool{
+	"apt":     &apt,
+	"node":    &node,
+	"file":    &file,
+	"history": &history,
+	"pip":     &pip,
+}
 
 var json bool
 var eng bool
@@ -27,192 +31,52 @@ var file bool
 var history bool
 var pip bool
 
-var analyzeFlagMap = map[string]*bool{
-	"apt":     &apt,
-	"node":    &node,
-	"file":    &file,
-	"history": &history,
-	"pip":     &pip,
+var RootCmd = &cobra.Command{
+	Use:   "container-diff",
+	Short: "container-diff is a tool for comparing and analyzing container images",
+	Long:  `container-diff is a tool for comparing and analyzing container images.`,
 }
 
-var RootCmd = &cobra.Command{
-	Use:   "To analyze a single image: [image].  To compare two images: [image1] [image2]",
-	Short: "Analyze a single image or compare two images.",
-	Long:  `Analyzes a single image or compares two images using the specifed analyzers/differs as indicated via flags (see documentation for available ones).`,
-	Run: func(cmd *cobra.Command, args []string) {
-		if validArgs, err := validateArgs(args); !validArgs {
-			glog.Error(err.Error())
-			os.Exit(1)
-		}
+// Execute adds all child commands to the root command sets flags appropriately.
+// This is called by main.main(). It only needs to happen once to the rootCmd.
+func Execute() {
+	if err := RootCmd.Execute(); err != nil {
+		os.Exit(1)
+	}
 
-		utils.SetDockerEngine(eng)
+}
 
-		analyzeArgs := []string{}
-		allAnalyzers := getAllAnalyzers()
-		for _, name := range allAnalyzers {
-			if *analyzeFlagMap[name] == true {
-				analyzeArgs = append(analyzeArgs, name)
+func init() {
+	//TODO(aaron-prindle) see if this is still needed
+	// pflag.CommandLine.AddGoFlagSet(goflag.CommandLine)
+}
+
+func outputResults(resultMap map[string]utils.Result) {
+	// Outputs diff/analysis results in alphabetical order by analyzer name
+	sortedTypes := []string{}
+	for analyzerType := range resultMap {
+		sortedTypes = append(sortedTypes, analyzerType)
+	}
+	sort.Strings(sortedTypes)
+
+	results := make([]interface{}, len(resultMap))
+	for i, analyzerType := range sortedTypes {
+		result := resultMap[analyzerType]
+		if json {
+			results[i] = result.OutputStruct()
+		} else {
+			err := result.OutputText(analyzerType)
+			if err != nil {
+				glog.Error(err)
 			}
 		}
-
-		// If no differs/analyzers are specified, perform them all as the default
-		if len(analyzeArgs) == 0 {
-			analyzeArgs = allAnalyzers
-		}
-
-		var err error
-		// In the case of one image, "analyzes" it
-		// In the case of two images, takes their "diff"
-		if len(args) == 1 {
-			err = analyzeImage(args[0], analyzeArgs)
-		} else {
-			err = diffImages(args[0], args[1], analyzeArgs)
-		}
-
+	}
+	if json {
+		err := utils.JSONify(results)
 		if err != nil {
 			glog.Error(err)
-			os.Exit(1)
 		}
-	},
-}
-
-func diffImages(image1Arg, image2Arg string, diffArgs []string) error {
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	glog.Infof("Starting diff on images %s and %s, using differs: %s", image1Arg, image2Arg, diffArgs)
-
-	var image1, image2 utils.Image
-	var err error
-	go func() {
-		defer wg.Done()
-		image1, err = utils.ImagePrepper{image1Arg}.GetImage()
-		if err != nil {
-			glog.Error(err.Error())
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		image2, err = utils.ImagePrepper{image2Arg}.GetImage()
-		if err != nil {
-			glog.Error(err.Error())
-		}
-	}()
-	wg.Wait()
-	if err != nil {
-		cleanupImage(image1)
-		cleanupImage(image2)
-		return errors.New("Could not perform image diff")
 	}
-
-	diffTypes, err := differs.GetAnalyzers(diffArgs)
-	if err != nil {
-		glog.Error(err.Error())
-		cleanupImage(image1)
-		cleanupImage(image2)
-		return errors.New("Could not perform image diff")
-	}
-
-	req := differs.DiffRequest{image1, image2, diffTypes}
-	if diffs, err := req.GetDiff(); err == nil {
-		// Outputs diff results in alphabetical order by differ name
-		sortedTypes := []string{}
-		for name := range diffs {
-			sortedTypes = append(sortedTypes, name)
-		}
-		sort.Strings(sortedTypes)
-		glog.Info("Retrieving diffs")
-		diffResults := []utils.DiffResult{}
-		for _, diffType := range sortedTypes {
-			diff := diffs[diffType]
-			if json {
-				diffResults = append(diffResults, diff.GetStruct())
-			} else {
-				err = diff.OutputText(diffType)
-				if err != nil {
-					glog.Error(err)
-				}
-			}
-		}
-		if json {
-			err = utils.JSONify(diffResults)
-			if err != nil {
-				glog.Error(err)
-			}
-		}
-		if !save {
-			cleanupImage(image1)
-			cleanupImage(image2)
-
-		} else {
-			dir, _ := os.Getwd()
-			glog.Infof("Images were saved at %s as %s and %s", dir, image1.FSPath, image2.FSPath)
-		}
-	} else {
-		glog.Error(err.Error())
-		cleanupImage(image1)
-		cleanupImage(image2)
-		return errors.New("Could not perform image diff")
-	}
-
-	return nil
-}
-
-func analyzeImage(imageArg string, analyzerArgs []string) error {
-	image, err := utils.ImagePrepper{imageArg}.GetImage()
-	if err != nil {
-		glog.Error(err.Error())
-		cleanupImage(image)
-		return errors.New("Could not perform image analysis")
-	}
-	analyzeTypes, err := differs.GetAnalyzers(analyzerArgs)
-	if err != nil {
-		glog.Error(err.Error())
-		cleanupImage(image)
-		return errors.New("Could not perform image analysis")
-	}
-
-	req := differs.SingleRequest{image, analyzeTypes}
-	if analyses, err := req.GetAnalysis(); err == nil {
-		// Outputs analysis results in alphabetical order by differ name
-		sortedTypes := []string{}
-		for name := range analyses {
-			sortedTypes = append(sortedTypes, name)
-		}
-		sort.Strings(sortedTypes)
-		glog.Info("Retrieving diffs")
-		analyzeResults := []utils.AnalyzeResult{}
-		for _, analyzeType := range sortedTypes {
-			analysis := analyses[analyzeType]
-			if json {
-				analyzeResults = append(analyzeResults, analysis.GetStruct())
-			} else {
-				err = analysis.OutputText(analyzeType)
-				if err != nil {
-					glog.Error(err)
-				}
-			}
-		}
-		if json {
-			err = utils.JSONify(analyzeResults)
-			if err != nil {
-				glog.Error(err)
-			}
-		}
-		if !save {
-			cleanupImage(image)
-		} else {
-			dir, _ := os.Getwd()
-			glog.Infof("Image was saved at %s as %s", dir, image.FSPath)
-		}
-	} else {
-		glog.Error(err.Error())
-		cleanupImage(image)
-		return errors.New("Could not perform image analysis")
-	}
-
-	return nil
 }
 
 func cleanupImage(image utils.Image) {
@@ -301,16 +165,4 @@ func remove(path string, dir bool) string {
 		errStr = "\nUnable to remove " + path
 	}
 	return errStr
-}
-
-func init() {
-	pflag.CommandLine.AddGoFlagSet(goflag.CommandLine)
-	RootCmd.Flags().BoolVarP(&json, "json", "j", false, "JSON Output defines if the diff should be returned in a human readable format (false) or a JSON (true).")
-	RootCmd.Flags().BoolVarP(&eng, "eng", "e", false, "By default the docker calls are shelled out locally, set this flag to use the Docker Engine Client (version compatibility required).")
-	RootCmd.Flags().BoolVarP(&pip, "pip", "p", false, "Set this flag to use the pip differ.")
-	RootCmd.Flags().BoolVarP(&node, "node", "n", false, "Set this flag to use the node differ.")
-	RootCmd.Flags().BoolVarP(&apt, "apt", "a", false, "Set this flag to use the apt differ.")
-	RootCmd.Flags().BoolVarP(&file, "file", "f", false, "Set this flag to use the file differ.")
-	RootCmd.Flags().BoolVarP(&history, "history", "d", false, "Set this flag to use the dockerfile history differ.")
-	RootCmd.Flags().BoolVarP(&save, "save", "s", false, "Set this flag to save rather than remove the final image filesystems on exit.")
 }

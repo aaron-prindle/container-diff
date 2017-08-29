@@ -1,5 +1,10 @@
 package utils
 
+type Result interface {
+	OutputStruct() interface{}
+	OutputText(resultType string) error
+}
+
 type AnalyzeResult interface {
 	GetStruct() AnalyzeResult
 	OutputText(analyzeType string) error
