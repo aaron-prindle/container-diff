@@ -61,64 +61,51 @@ func diffImages(image1Arg, image2Arg string, diffArgs []string) error {
 
 	glog.Infof("Starting diff on images %s and %s, using differs: %s", image1Arg, image2Arg, diffArgs)
 
-	var image1, image2 utils.Image
-	go func() {
-		defer wg.Done()
-		ip := utils.ImagePrepper{
-			Source: image1Arg,
-			Client: cli,
-		}
-		image1, err = ip.GetImage()
-		if err != nil {
-			glog.Error(err.Error())
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		ip := utils.ImagePrepper{
-			Source: image2Arg,
-			Client: cli,
-		}
-		image2, err = ip.GetImage()
-		if err != nil {
-			glog.Error(err.Error())
-		}
-	}()
+	imageMap := map[string]*utils.Image{
+		image1Arg: &utils.Image{},
+		image2Arg: &utils.Image{},
+	}
+	for imageArg, _ := range imageMap {
+		go func(imageMap map[string]*utils.Image) {
+			defer wg.Done()
+			ip := utils.ImagePrepper{
+				Source: imageArg,
+				Client: cli,
+			}
+			image, err := ip.GetImage()
+			imageMap[imageArg] = &image
+			if err != nil {
+				glog.Error(err.Error())
+			}
+		}(imageMap)
+	}
 	wg.Wait()
-	if err != nil {
-		cleanupImage(image1)
-		cleanupImage(image2)
-		return errors.New("Could not perform image diff")
+
+	if !save {
+		defer cleanupImage(*imageMap[image1Arg])
+		defer cleanupImage(*imageMap[image2Arg])
 	}
 
 	diffTypes, err := differs.GetAnalyzers(diffArgs)
 	if err != nil {
 		glog.Error(err.Error())
-		cleanupImage(image1)
-		cleanupImage(image2)
 		return errors.New("Could not perform image diff")
 	}
 
-	req := differs.DiffRequest{image1, image2, diffTypes}
-	if diffs, err := req.GetDiff(); err == nil {
-		glog.Info("Retrieving diffs")
-		outputResults(diffs)
-		if !save {
-			cleanupImage(image1)
-			cleanupImage(image2)
-
-		} else {
-			dir, _ := os.Getwd()
-			glog.Infof("Images were saved at %s as %s and %s", dir, image1.FSPath, image2.FSPath)
-		}
-	} else {
+	req := differs.DiffRequest{*imageMap[image1Arg], *imageMap[image2Arg], diffTypes}
+	if diffs, err := req.GetDiff(); err != nil {
 		glog.Error(err.Error())
-		cleanupImage(image1)
-		cleanupImage(image2)
 		return errors.New("Could not perform image diff")
 	}
+	glog.Info("Retrieving diffs")
+	outputResults(diffs)
 
+	if save {
+		dir, _ := os.Getwd()
+		glog.Infof("Images were saved at %s as %s and %s", dir, imageMap[image1Arg].FSPath,
+			imageMap[image2Arg].FSPath)
+
+	}
 	return nil
 }
 
